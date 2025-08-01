@@ -1,0 +1,8 @@
+node_modules
+src
+.git
+.vscode
+*.md
+tsconfig.json
+package-lock.json
+out/test

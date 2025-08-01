@@ -1,0 +1,41 @@
+{
+  "name": "flv-tag-preview",
+  "displayName": "FLV Tag Preview",
+  "publisher": "CoderWGB",
+  "author": "CoderWGB",
+  "description": "Preview FLV file metadata and tag structure in VS Code",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCustomEditor:flvTagPreview.viewer"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "flvTagPreview.viewer",
+        "displayName": "FLV Tag Preview",
+        "selector": [
+          {
+            "filenamePattern": "*.flv"
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "@types/node": "20.x",
+    "typescript": "^5.0.0"
+  }
+}
