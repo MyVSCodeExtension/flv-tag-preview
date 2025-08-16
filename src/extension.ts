@@ -20,10 +20,10 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 
 	// Register a command to open the FLV viewer panel (optional, can be triggered by clicking the view)
-	const openPreviewCommand = vscode.commands.registerCommand('flv-tag-preview.openPreview', (uri: vscode.Uri) => {
-		FlvViewerProvider.openPreview(context, uri);
-	});
-	context.subscriptions.push(openPreviewCommand);
+	// const openPreviewCommand = vscode.commands.registerCommand('flv-tag-preview.openPreview', (uri: vscode.Uri) => {
+	// 	FlvViewerProvider.openPreview(context, uri);
+	// });
+	// context.subscriptions.push(openPreviewCommand);
 }
 
 // This method is called when your extension is deactivated

@@ -1,622 +1,363 @@
+
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 
-// Define interfaces for FLV structure
+// --- AMF0 Parsing Utilities ---
+
+class AmfParser {
+    private buffer: Buffer;
+    private offset: number = 0;
+
+    constructor(buffer: Buffer) {
+        this.buffer = buffer;
+    }
+
+    private readUi8(): number {
+        const value = this.buffer.readUInt8(this.offset);
+        this.offset += 1;
+        return value;
+    }
+
+    private readUi16(): number {
+        const value = this.buffer.readUInt16BE(this.offset);
+        this.offset += 2;
+        return value;
+    }
+
+    private readDouble(): number {
+        const value = this.buffer.readDoubleBE(this.offset);
+        this.offset += 8;
+        return value;
+    }
+
+    private parseAmfString(): string {
+        const length = this.readUi16();
+        const value = this.buffer.toString('utf8', this.offset, this.offset + length);
+        this.offset += length;
+        return value;
+    }
+
+    public parseAmfValue(typeMarker?: number): any {
+        if (typeMarker === undefined) {
+            typeMarker = this.readUi8();
+        }
+
+        switch (typeMarker) {
+            case 0: // Number
+                return this.readDouble();
+            case 1: // Boolean
+                return this.readUi8() !== 0;
+            case 2: // String
+                return this.parseAmfString();
+            case 3: // Object
+                {
+                    const obj: { [key: string]: any } = {};
+                    while (true) {
+                        try {
+                            const key = this.parseAmfString();
+                            if (!key) break;
+                            const valueType = this.readUi8();
+                            if (valueType === 9) break; // Object End Marker
+                            obj[key] = this.parseAmfValue(valueType);
+                        } catch (e) {
+                            break; // Reached end of data
+                        }
+                    }
+                    return obj;
+                }
+            case 8: // ECMA Array
+                {
+                    const count = this.buffer.readUInt32BE(this.offset);
+                    this.offset += 4;
+                    const arr: { [key: string]: any } = {};
+                    for (let i = 0; i < count; i++) {
+                        const key = this.parseAmfString();
+                        const value = this.parseAmfValue();
+                        arr[key] = value;
+                    }
+                    this.offset += 3; // Skip object end marker
+                    return arr;
+                }
+            case 10: // Strict Array
+                {
+                    const count = this.buffer.readUInt32BE(this.offset);
+                    this.offset += 4;
+                    const arr: any[] = [];
+                    for (let i = 0; i < count; i++) {
+                        arr.push(this.parseAmfValue());
+                    }
+                    return arr;
+                }
+            default:
+                return `Unsupported AMF Type: ${typeMarker}`;
+        }
+    }
+}
+
+
+// --- Interfaces for FLV Structure ---
+
 interface FlvHeader {
-	signature: string;
-	version: number;
-	flags: {
-		hasAudio: boolean;
-		hasVideo: boolean;
-	};
-	dataOffset: number;
+    Version: number;
+    HasVideo: boolean;
+    HasAudio: boolean;
+    HeaderSize: number;
 }
 
-interface FlvTagBase {
-	type: 'audio' | 'video' | 'script';
-	dataSize: number;
-	timestamp: number;
-	streamId: number;
+interface FlvTag {
+    offset: number;
+    tag_type: number;
+    data_size: number;
+    timestamp: number;
+    stream_id: number;
+    total_size: number;
+    details: { [key: string]: any };
+    analysis: { [key: string]: any };
+    get_type_name(): string;
+    get_display_info(): { [key: string]: any };
 }
 
-interface FlvAudioTag extends FlvTagBase {
-	type: 'audio';
-	soundFormat: number;
-	soundRate: number;
-	soundSize: number;
-	soundType: number;
-	aacPacketType?: number; // For AAC
-	details: { [key: string]: any };
+const TAG_TYPES = { 8: "Audio", 9: "Video", 18: "Script Data" };
+const AUDIO_FORMATS = { 0: "LPCM", 1: "ADPCM", 2: "MP3", 3: "LPCM LE", 4: "Nellymoser 16kHz", 5: "Nellymoser 8kHz", 6: "Nellymoser", 7: "G.711 A-law", 8: "G.711 mu-law", 9: "reserved", 10: "AAC", 11: "Speex", 14: "MP3 8kHz", 15: "Device-specific" };
+const VIDEO_FRAME_TYPES = { 1: "Key frame", 2: "Inter frame", 3: "Disposable inter frame", 4: "Generated key frame", 5: "Video info/command frame" };
+const VIDEO_CODECS = { 2: "Sorenson H.263", 3: "Screen video", 4: "On2 VP6", 5: "On2 VP6 with alpha", 6: "Screen video v2", 7: "AVC (H.264)" };
+
+
+class FlvTagImpl implements FlvTag {
+    offset: number;
+    tag_type: number;
+    data_size: number;
+    timestamp: number;
+    stream_id: number;
+    data: Buffer;
+    total_size: number;
+    details: { [key: string]: any } = {};
+    analysis: { [key: string]: any } = {};
+
+    constructor(offset: number, data: Buffer, global_metadata: { [key: string]: any }) {
+        this.offset = offset;
+        this.tag_type = data[0];
+        this.data_size = (data[1] << 16) | (data[2] << 8) | data[3];
+        this.timestamp = (data[4] << 16) | (data[5] << 8) | data[6] | (data[7] << 24);
+        this.stream_id = (data[8] << 16) | (data[9] << 8) | data[10];
+        this.data = data.slice(11, 11 + this.data_size);
+        this.total_size = 11 + this.data_size + 4;
+
+        if (this.tag_type === 8) {
+            this._parse_audio_data(global_metadata);
+        } else if (this.tag_type === 9) {
+            this._parse_video_data();
+        } else if (this.tag_type === 18) {
+            this._parse_script_data();
+        }
+    }
+
+    private _parse_audio_data(meta: { [key: string]: any }) {
+        if (!this.data.length) return;
+        const flags = this.data[0];
+        const sound_format = flags >> 4;
+        this.details["Format"] = AUDIO_FORMATS[sound_format as keyof typeof AUDIO_FORMATS] || `Unknown (${sound_format})`;
+        // ... more audio parsing logic from python script
+    }
+
+    private _parse_video_data() {
+        if (!this.data.length) return;
+        const flags = this.data[0];
+        const frame_type = (flags >> 4) & 0xF;
+        const codec_id = flags & 0xF;
+        this.details["Frame Type"] = VIDEO_FRAME_TYPES[frame_type as keyof typeof VIDEO_FRAME_TYPES] || `Unknown (${frame_type})`;
+        this.details["Codec ID"] = VIDEO_CODECS[codec_id as keyof typeof VIDEO_CODECS] || `Unknown (${codec_id})`;
+        if (codec_id === 7 && this.data.length > 4) { // AVC
+            const avc_packet_type = this.data[1];
+            const cts = (this.data[2] << 16) | (this.data[3] << 8) | this.data[4];
+            this.details["AVC Packet Type"] = { 0: "Seq. header", 1: "NALU", 2: "End of seq." }[avc_packet_type] || "Unknown";
+            this.details["CompositionTime Offset"] = `${cts} ms`;
+        }
+    }
+
+    private _parse_script_data() {
+        if (!this.data.length) return;
+        try {
+            const parser = new AmfParser(this.data);
+            const name = parser.parseAmfValue();
+            const value = parser.parseAmfValue();
+            this.details["Name"] = name;
+            if (name === "onMetaData") {
+                this.details["Type"] = "Metadata";
+                this.details["Metadata"] = value;
+            } else {
+                this.details["Value"] = value;
+            }
+        } catch (e: any) {
+            this.details["Parse Error"] = e.toString();
+        }
+    }
+
+    get_type_name(): string {
+        return TAG_TYPES[this.tag_type as keyof typeof TAG_TYPES] || `Unknown (${this.tag_type})`;
+    }
+
+    get_display_info(): { [key: string]: any; } {
+        const info = {
+            "Offset": `0x${this.offset.toString(16).toUpperCase().padStart(8, '0')}`,
+            "Type": this.get_type_name(),
+            "Size": this.data_size,
+            "Timestamp": `${this.timestamp} ms`
+        };
+        if (Object.keys(this.analysis).length > 0) {
+            (info as any)["Analysis"] = this.analysis;
+        }
+        (info as any)["Details"] = this.details;
+        return info;
+    }
 }
 
-interface FlvVideoTag extends FlvTagBase {
-	type: 'video';
-	frameType: number;
-	codecId: number;
-	avcPacketType?: number; // For H.264
-	compositionTime?: number; // For H.264
-	details: { [key: string]: any };
-}
-
-interface FlvScriptTag extends FlvTagBase {
-	type: 'script';
-	name?: string; // Usually "onMetaData"
-	details: { [key: string]: any };
-}
-
-type FlvTag = FlvAudioTag | FlvVideoTag | FlvScriptTag;
-
-interface FlvMetadata {
-	duration?: number;
-	width?: number;
-	height?: number;
-	videoCodec?: string;
-	audioCodec?: string;
-	[key: string]: any; // For other potential metadata
-}
 
 export class FlvViewerProvider implements vscode.CustomReadonlyEditorProvider {
-	public static readonly viewType = 'flvTagPreview.viewer';
+    public static readonly viewType = 'flvTagPreview.viewer';
 
-	private _context: vscode.ExtensionContext;
+    constructor(private readonly context: vscode.ExtensionContext) { }
 
-	constructor(context: vscode.ExtensionContext) {
-		this._context = context;
-	}
+    public async openCustomDocument(
+        uri: vscode.Uri,
+        _openContext: vscode.CustomDocumentOpenContext,
+        _token: vscode.CancellationToken
+    ): Promise<vscode.CustomDocument> {
+        return { uri, dispose: () => { } };
+    }
 
-	// Open a preview panel for a given URI
-	public static openPreview(context: vscode.ExtensionContext, uri: vscode.Uri) {
-		// In a real implementation, you might want to manage multiple panels or find existing ones
-		// For simplicity, we'll just log for now
-		console.log(`Opening preview for ${uri.fsPath}`);
-	}
+    public async resolveCustomEditor(
+        document: vscode.CustomDocument,
+        webviewPanel: vscode.WebviewPanel,
+        _token: vscode.CancellationToken
+    ): Promise<void> {
+        webviewPanel.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]
+        };
 
-	// Called when our custom editor is opened
-	public async resolveCustomEditor(
-		document: vscode.CustomDocument,
-		webviewPanel: vscode.WebviewPanel,
-		_token: vscode.CancellationToken
-	): Promise<void> {
-		// Setup initial html for the webview
-		webviewPanel.webview.options = {
-			enableScripts: true,
-		};
+        try {
+            const fileContent = await vscode.workspace.fs.readFile(document.uri);
+            const { header, tags, metadata } = this._parseFlv(Buffer.from(fileContent));
 
-		// Set the initial HTML content
-		webviewPanel.webview.html = this._getHtmlForWebview(webviewPanel.webview);
+            webviewPanel.webview.html = this._getHtmlForWebview(webviewPanel.webview);
 
-		const filePath = document.uri.fsPath;
-		
-		// Check if it's an FLV file
-		if (!filePath.toLowerCase().endsWith('.flv')) {
-			webviewPanel.webview.postMessage({ command: 'error', message: 'Selected file is not an FLV file.' });
-			return;
-		}
+            webviewPanel.webview.postMessage({
+                command: 'flvData',
+                header,
+                tags: tags.map(t => t.get_display_info()),
+                metadata
+            });
 
-		try {
-			// Parse the FLV file
-			const { header, tags, metadata } = await this._parseFlvFile(filePath);
-			
-			// Send parsed data to the webview
-			webviewPanel.webview.postMessage({ 
-				command: 'update', 
-				header: header,
-				metadata: metadata,
-				tags: tags
-			});
-		} catch (error: any) {
-			console.error('Error parsing FLV file:', error);
-			webviewPanel.webview.postMessage({ command: 'error', message: `Error parsing FLV file: ${error.message}` });
-		}
+        } catch (e: any) {
+            webviewPanel.webview.html = `<h1>Error parsing FLV file</h1><p>${e.message}</p>`;
+        }
+    }
 
-		// Handle messages from the webview
-		webviewPanel.webview.onDidReceiveMessage(
-			message => {
-				switch (message.command) {
-					case 'alert':
-						vscode.window.showErrorMessage(message.text);
-						return;
-				}
-			},
-			undefined,
-			this._context.subscriptions
-		);
-	}
+    private _parseFlv(data: Buffer): { header: FlvHeader, tags: FlvTag[], metadata: any } {
+        if (data.length < 9 || data.toString('utf8', 0, 3) !== 'FLV') {
+            throw new Error("Invalid FLV file");
+        }
 
-	// Create a CustomDocument for a given URI
-	public async openCustomDocument(
-		uri: vscode.Uri,
-		openContext: vscode.CustomDocumentOpenContext,
-		token: vscode.CancellationToken
-	): Promise<vscode.CustomDocument> {
-		return {
-			uri,
-			dispose: () => {}
-		};
-	}
+        const header: FlvHeader = {
+            Version: data[3],
+            HasVideo: !!(data[4] & 1),
+            HasAudio: !!(data[4] & 4),
+            HeaderSize: data.readUInt32BE(5)
+        };
 
-	// Enhanced FLV parser
-	private async _parseFlvFile(filePath: string): Promise<{ header: FlvHeader, tags: FlvTag[], metadata: FlvMetadata }> {
-		return new Promise((resolve, reject) => {
-			fs.readFile(filePath, (err, data) => {
-				if (err) {
-					reject(err);
-					return;
-				}
+        let offset = header.HeaderSize;
+        // PreviousTagSize0 is always 0
+        offset += 4;
 
-				let offset = 0;
-				const header: FlvHeader = {
-					signature: '',
-					version: 0,
-					flags: { hasAudio: false, hasVideo: false },
-					dataOffset: 0
-				};
-				const tags: FlvTag[] = [];
-				const metadata: FlvMetadata = {};
+        let metadata = {};
+        const tags: FlvTag[] = [];
 
-				try {
-					// Parse FLV Header (9 bytes)
-					if (data.length < 9) {
-						throw new Error('File too small to be a valid FLV file');
-					}
-					
-					header.signature = data.toString('utf8', 0, 3);
-					if (header.signature !== 'FLV') {
-						throw new Error('Invalid FLV signature');
-					}
-					
-					header.version = data.readUInt8(3);
-					const flags = data.readUInt8(4);
-					header.flags = {
-						hasAudio: (flags & 0x04) !== 0,
-						hasVideo: (flags & 0x01) !== 0
-					};
-					header.dataOffset = data.readUInt32BE(5);
+        // First pass to find metadata
+        let tempOffset = offset;
+        while (tempOffset < data.length - 11) {
+            const tagHeaderData = data.slice(tempOffset, tempOffset + 11);
+            const data_size = (tagHeaderData[1] << 16) | (tagHeaderData[2] << 8) | tagHeaderData[3];
+            const tag_type = tagHeaderData[0];
 
-					offset = header.dataOffset;
+            if (tag_type === 18) { // Script Data
+                const tagData = data.slice(tempOffset, tempOffset + 11 + data_size);
+                const tag = new FlvTagImpl(tempOffset, tagData, {});
+                if (tag.details["Name"] === "onMetaData") {
+                    metadata = tag.details["Metadata"];
+                    break; // Found it
+                }
+            }
+            tempOffset += 11 + data_size + 4;
+        }
 
-					// Skip previous tag size (4 bytes)
-					offset += 4;
 
-					// Parse FLV Tags
-					let tagIndex = 0;
-					while (offset < data.length - 15) { // Ensure there's enough data for a minimal tag header
-						const tagType = data.readUInt8(offset);
-						const dataSize = data.readUIntBE(offset + 1, 3);
-						const timestamp = data.readUIntBE(offset + 4, 3);
-						const timestampExtended = data.readUInt8(offset + 7);
-						const streamId = data.readUIntBE(offset + 8, 3);
+        while (offset < data.length - 11) {
+            const data_size = (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3];
+            const tagData = data.slice(offset, offset + 11 + data_size);
+            tags.push(new FlvTagImpl(offset, tagData, metadata));
+            offset += 11 + data_size + 4; // 11 for header, data_size, 4 for previous tag size
+        }
 
-						const fullTimestamp = (timestampExtended << 24) | timestamp;
+        return { header, tags, metadata };
+    }
 
-						if (offset + 11 + dataSize > data.length) {
-							console.warn('Incomplete tag found at offset', offset);
-							break; // Stop parsing if tag exceeds file size
-						}
+    private _getHtmlForWebview(webview: vscode.Webview): string {
+        const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'main.js'));
+        const nonce = getNonce();
 
-						const tagBody = data.subarray(offset + 11, offset + 11 + dataSize);
+        return `<!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>FLV Tag Preview</title>
+                <style>
+                    /* Add styles for foldable tree */
+                    .tree-item {
+                        margin-left: 20px;
+                    }
+                    .tree-item-header {
+                        cursor: pointer;
+                        user-select: none;
+                    }
+                    .tree-item-header::before {
+                        content: "▶";
+                        display: inline-block;
+                        width: 15px;
+                    }
+                    .tree-item-header.expanded::before {
+                        transform: rotate(90deg);
+                    }
+                    .tree-item-children {
+                        display: none;
+                    }
+                    .tree-item-children.expanded {
+                        display: block;
+                    }
+                </style>
+            </head>
+            <body>
+                <h1>FLV Info</h1>
+                <h2>Header</h2>
+                <div id="header"></div>
+                <h2>Metadata</h2>
+                <div id="metadata"></div>
+                <h2>Tags</h2>
+                <div id="tags"></div>
+                <script nonce="${nonce}" src="${scriptUri}"></script>
+            </body>
+            </html>`;
+    }
+}
 
-						let tag: FlvTag;
-						
-						// Parse based on tag type
-						switch (tagType) {
-							case 8: // Audio
-								tag = this._parseAudioTag(tagBody, dataSize, fullTimestamp, streamId, tagIndex);
-								break;
-							case 9: // Video
-								tag = this._parseVideoTag(tagBody, dataSize, fullTimestamp, streamId, tagIndex);
-								break;
-							case 18: // Script
-								tag = this._parseScriptTag(tagBody, dataSize, fullTimestamp, streamId, tagIndex);
-								// Extract metadata from script tag
-								if (tag.type === 'script' && tag.details) {
-									Object.assign(metadata, tag.details);
-								}
-								break;
-							default:
-								// Unknown tag type, create a generic one
-								tag = {
-									type: 'script',
-									dataSize: dataSize,
-									timestamp: fullTimestamp,
-									streamId: streamId,
-									details: {
-										error: `Unknown tag type: ${tagType}`,
-										body: tagBody.toString('hex')
-									}
-								};
-						}
-
-						tags.push(tag);
-						tagIndex++;
-						offset += 11 + dataSize + 4; // Tag header + body + previous tag size (4 bytes)
-					}
-
-					resolve({ header, tags, metadata });
-				} catch (parseError: any) {
-					reject(parseError);
-				}
-			});
-		});
-	}
-
-	// Parse Audio Tag
-	private _parseAudioTag(body: Buffer, dataSize: number, timestamp: number, streamId: number, index: number): FlvAudioTag {
-		const soundFormat = (body[0] & 0xF0) >> 4;
-		const soundRate = (body[0] & 0x0C) >> 2;
-		const soundSize = (body[0] & 0x02) >> 1;
-		const soundType = body[0] & 0x01;
-		
-		const tag: FlvAudioTag = {
-			type: 'audio',
-			dataSize: dataSize,
-			timestamp: timestamp,
-			streamId: streamId,
-			soundFormat: soundFormat,
-			soundRate: soundRate,
-			soundSize: soundSize,
-			soundType: soundType,
-			details: {
-				index: index,
-				soundFormatStr: this._getSoundFormatStr(soundFormat),
-				soundRateStr: this._getSoundRateStr(soundRate),
-				soundSizeStr: soundSize === 0 ? '8-bit' : '16-bit',
-				soundTypeStr: soundType === 0 ? 'Mono' : 'Stereo'
-			}
-		};
-
-		// For AAC (format 10)
-		if (soundFormat === 10 && body.length > 1) {
-			tag.aacPacketType = body[1];
-			tag.details.aacPacketTypeStr = tag.aacPacketType === 0 ? 'Sequence Header' : 'Raw';
-			
-			// Skip AAC sequence header for details
-			if (tag.aacPacketType !== 0 && body.length > 2) {
-				// Include raw AAC data (truncated)
-				const aacData = body.subarray(2, Math.min(20, body.length));
-				tag.details.rawAacData = aacData.toString('hex');
-			}
-		} else if (body.length > 1) {
-			// Include raw audio data (truncated)
-			const audioData = body.subarray(1, Math.min(20, body.length));
-			tag.details.rawAudioData = audioData.toString('hex');
-		}
-
-		return tag;
-	}
-
-	// Parse Video Tag
-	private _parseVideoTag(body: Buffer, dataSize: number, timestamp: number, streamId: number, index: number): FlvVideoTag {
-		const frameType = (body[0] & 0xF0) >> 4;
-		const codecId = body[0] & 0x0F;
-		
-		const tag: FlvVideoTag = {
-			type: 'video',
-			dataSize: dataSize,
-			timestamp: timestamp,
-			streamId: streamId,
-			frameType: frameType,
-			codecId: codecId,
-			details: {
-				index: index,
-				frameTypeStr: this._getFrameTypeStr(frameType),
-				codecIdStr: this._getCodecIdStr(codecId)
-			}
-		};
-
-		// For H.264 (codec 7)
-		if (codecId === 7 && body.length > 4) {
-			tag.avcPacketType = body[1];
-			// Composition time is a signed 24-bit integer
-			const compositionTimeBytes = body.subarray(2, 5);
-			let compositionTime = compositionTimeBytes[0] << 16 | compositionTimeBytes[1] << 8 | compositionTimeBytes[2];
-			// Convert to signed 24-bit integer
-			if (compositionTime & 0x800000) {
-				compositionTime = compositionTime - 0x1000000;
-			}
-			tag.compositionTime = compositionTime;
-			
-			tag.details.avcPacketTypeStr = this._getAvcPacketTypeStr(tag.avcPacketType);
-			tag.details.compositionTime = compositionTime;
-			
-			// Skip AVC sequence header/configuration record for details
-			if (tag.avcPacketType !== 0 && body.length > 5) {
-				// Include raw H.264 NAL data (truncated)
-				const nalData = body.subarray(5, Math.min(25, body.length));
-				tag.details.rawNalData = nalData.toString('hex');
-			}
-		} else if (body.length > 1) {
-			// Include raw video data (truncated)
-			const videoData = body.subarray(1, Math.min(20, body.length));
-			tag.details.rawVideoData = videoData.toString('hex');
-		}
-
-		return tag;
-	}
-
-	// Parse Script Tag (simplified)
-	private _parseScriptTag(body: Buffer, dataSize: number, timestamp: number, streamId: number, index: number): FlvScriptTag {
-		// This is a very simplified script tag parser.
-		// A full implementation would need a proper AMF0/AMF3 parser.
-		// Here we just look for some common keys.
-		
-		const tag: FlvScriptTag = {
-			type: 'script',
-			dataSize: dataSize,
-			timestamp: timestamp,
-			streamId: streamId,
-			details: {
-				index: index
-			}
-		};
-		
-		// Look for "onMetaData" string which usually starts the metadata object
-		const onMetaDataIndex = body.indexOf('onMetaData');
-		if (onMetaDataIndex !== -1) {
-			tag.name = 'onMetaData';
-			tag.details.name = 'onMetaData';
-			
-			// This is a very basic heuristic and not a real parser
-			// In a real-world scenario, you'd use an AMF parser library
-			try {
-				// Try to find simple key-value pairs after onMetaData
-				// This is highly simplified and error-prone
-				let pos = onMetaDataIndex + 'onMetaData'.length;
-				
-				// Skip some bytes that are part of AMF encoding structure
-				// This is a guess and may not work for all files
-				pos += 3; 
-				
-				while (pos < body.length - 8) {
-					// Check for string type marker (0x02)
-					if (body.readUInt8(pos) === 0x02) {
-						const strLen = body.readUInt16BE(pos + 1);
-						if (pos + 3 + strLen <= body.length) {
-							const key = body.toString('utf8', pos + 3, pos + 3 + strLen);
-							pos += 3 + strLen;
-							
-							// Check for number type marker (0x00)
-							if (body.readUInt8(pos) === 0x00 && pos + 9 <= body.length) {
-								// Read 64-bit big-endian float (double)
-								const value = body.readDoubleBE(pos + 1);
-								tag.details[key] = value;
-								pos += 9;
-							} else if (body.readUInt8(pos) === 0x01 && pos + 2 <= body.length) {
-								// Boolean type (0x01)
-								const boolValue = body.readUInt8(pos + 1) !== 0;
-								tag.details[key] = boolValue;
-								pos += 2;
-							} else {
-								// Skip unknown types or complex structures
-								pos++;
-							}
-						} else {
-							break;
-						}
-					} else {
-						pos++;
-					}
-				}
-			} catch (e) {
-				console.warn('Error extracting metadata:', e);
-				tag.details.parseError = `Error parsing script tag: ${e}`;
-			}
-		} else {
-			tag.details.note = 'Script tag does not contain "onMetaData"';
-			// Include raw data (truncated)
-			const scriptData = body.subarray(0, Math.min(30, body.length));
-			tag.details.rawScriptData = scriptData.toString('hex');
-		}
-
-		return tag;
-	}
-
-	// Helper functions for human-readable strings
-	private _getSoundFormatStr(format: number): string {
-		const formats = [
-			'Linear PCM, platform endian',
-			'ADPCM',
-			'MP3',
-			'Linear PCM, little endian',
-			'Nellymoser 16-kHz mono',
-			'Nellymoser 8-kHz mono',
-			'Nellymoser',
-			'G.711 A-law logarithmic PCM',
-			'G.711 mu-law logarithmic PCM',
-			'reserved',
-			'AAC',
-			'Speex',
-			'reserved',
-			'reserved',
-			'MP3 8-Khz',
-			'Device-specific sound'
-		];
-		return formats[format] || `Unknown (${format})`;
-	}
-
-	private _getSoundRateStr(rate: number): string {
-		const rates = ['5.5-kHz', '11-kHz', '22-kHz', '44-kHz'];
-		return rates[rate] || `Unknown (${rate})`;
-	}
-
-	private _getFrameTypeStr(frameType: number): string {
-		const types = ['reserved', 'Keyframe (for AVC, a seekable frame)', 'Inter frame (for AVC, a non-seekable frame)', 'Disposable inter frame (H.263 only)', 'Generated keyframe (reserved for server use only)', 'Video info/command frame'];
-		return types[frameType] || `Unknown (${frameType})`;
-	}
-
-	private _getCodecIdStr(codecId: number): string {
-		const codecs = ['Reserved', 'JPEG (currently unused)', 'Sorenson H.263', 'Screen video', 'On2 VP6', 'On2 VP6 with alpha channel', 'Screen video version 2', 'AVC'];
-		return codecs[codecId] || `Unknown (${codecId})`;
-	}
-
-	private _getAvcPacketTypeStr(packetType: number): string {
-		const types = ['AVC sequence header', 'AVC NALU', 'AVC end of sequence (lower level NALU sequence ender is not required or supported)'];
-		return types[packetType] || `Unknown (${packetType})`;
-	}
-	
-	// Helper to get tag type string (kept for backward compatibility)
-	private _getTagType(type: number): 'audio' | 'video' | 'script' {
-		switch (type) {
-			case 8: return 'audio';
-			case 9: return 'video';
-			case 18: return 'script';
-			default: return 'script'; // Default or unknown
-		}
-	}
-
-	// Get the static html used for the webview
-	private _getHtmlForWebview(webview: vscode.Webview): string {
-		// Local path to script and css for the webview
-		const scriptUri = webview.asWebviewUri(vscode.Uri.file(
-			path.join(this._context.extensionPath, 'media', 'main.js')
-		));
-
-		// Use a nonce to whitelist which scripts can be run
-		const nonce = this._getNonce();
-
-		return `<!DOCTYPE html>
-			<html lang="en">
-			<head>
-				<meta charset="UTF-8">
-				<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
-				<meta name="viewport" content="width=device-width, initial-scale=1.0">
-				<title>FLV Tag Preview</title>
-				<style>
-					body {
-						font-family: var(--vscode-font-family);
-						font-size: var(--vscode-editor-font-size);
-						color: var(--vscode-editor-foreground);
-						background-color: var(--vscode-editor-background);
-						margin: 0;
-						padding: 10px;
-					}
-					h1, h2, h3 {
-						color: var(--vscode-foreground);
-					}
-					.container {
-						padding: 10px;
-					}
-					.info-section {
-						margin-bottom: 20px;
-					}
-					.info-table {
-						width: 100%;
-						border-collapse: collapse;
-						margin-top: 5px;
-					}
-					.info-table th, .info-table td {
-						border: 1px solid var(--vscode-input-border);
-						padding: 5px 10px;
-						text-align: left;
-					}
-					.info-table th {
-						background-color: var(--vscode-sideBarSectionHeader-background);
-						font-weight: bold;
-					}
-					.tags-tree {
-						border: 1px solid var(--vscode-input-border);
-						border-radius: 3px;
-						padding: 5px;
-						max-height: 500px;
-						overflow-y: auto;
-					}
-					.tree-item {
-						margin-left: 20px;
-						padding: 2px 0;
-					}
-					.tree-item-header {
-						cursor: pointer;
-						user-select: none;
-						padding: 3px;
-						border-radius: 3px;
-					}
-					.tree-item-header:hover {
-						background-color: var(--vscode-list-hoverBackground);
-					}
-					.tree-item-header::before {
-						content: "▶";
-						display: inline-block;
-						width: 15px;
-						transition: transform 0.2s;
-					}
-					.tree-item-header.expanded::before {
-						transform: rotate(90deg);
-					}
-					.tree-item-children {
-						display: none;
-						padding-left: 15px;
-					}
-					.tree-item-children.expanded {
-						display: block;
-					}
-					.tag-details {
-						font-family: monospace;
-						white-space: pre-wrap;
-						word-break: break-all;
-						background-color: var(--vscode-textBlockQuote-background);
-						padding: 5px;
-						border-radius: 3px;
-						margin-top: 5px;
-					}
-					.error {
-						color: var(--vscode-errorForeground);
-					}
-				</style>
-			</head>
-			<body>
-				<div class="container">
-					<h1>FLV File Information</h1>
-					
-					<div class="info-section">
-						<h2>Header</h2>
-						<table class="info-table" id="header-table">
-							<thead>
-								<tr>
-									<th>Property</th>
-									<th>Value</th>
-								</tr>
-							</thead>
-							<tbody id="header-content">
-								<tr><td colspan="2">Loading...</td></tr>
-							</tbody>
-						</table>
-					</div>
-					
-					<div class="info-section">
-						<h2>Metadata</h2>
-						<table class="info-table" id="metadata-table">
-							<thead>
-								<tr>
-									<th>Property</th>
-									<th>Value</th>
-								</tr>
-							</thead>
-							<tbody id="metadata-content">
-								<tr><td colspan="2">Loading...</td></tr>
-							</tbody>
-						</table>
-					</div>
-					
-					<div class="info-section">
-						<h2>Tags</h2>
-						<div id="tags-content" class="tags-tree">Loading...</div>
-					</div>
-					
-					<div id="error-message" class="error"></div>
-				</div>
-				
-				<script nonce="${nonce}" src="${scriptUri}"></script>
-			</body>
-			</html>`;
-	}
-
-	private _getNonce() {
-		let text = '';
-		const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-		for (let i = 0; i < 32; i++) {
-			text += possible.charAt(Math.floor(Math.random() * possible.length));
-		}
-		return text;
-	}
+function getNonce() {
+    let text = '';
+    const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    for (let i = 0; i < 32; i++) {
+        text += possible.charAt(Math.floor(Math.random() * possible.length));
+    }
+    return text;
 }

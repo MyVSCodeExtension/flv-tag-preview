@@ -1,128 +1,60 @@
-// Script that runs in the webview
 
-(function () {
-	const vscode = acquireVsCodeApi();
+(function() {
+    const vscode = acquireVsCodeApi();
 
-	// Handle messages sent from the extension to the webview
-	window.addEventListener('message', event => {
-		const message = event.data; // The json data that the extension sent
-		switch (message.command) {
-			case 'update':
-				updateContent(message.header, message.metadata, message.tags);
-				break;
-			case 'error':
-				showError(message.message);
-				break;
-		}
-	});
+    function renderTree(data, container) {
+        for (const key in data) {
+            const value = data[key];
+            const li = document.createElement('li');
+            
+            if (typeof value === 'object' && value !== null) {
+                const details = document.createElement('details');
+                const summary = document.createElement('summary');
+                summary.textContent = key;
+                details.appendChild(summary);
+                
+                const ul = document.createElement('ul');
+                renderTree(value, ul);
+                details.appendChild(ul);
+                li.appendChild(details);
+            } else {
+                li.textContent = `${key}: ${value}`;
+            }
+            container.appendChild(li);
+        }
+    }
 
-	function updateContent(header, metadata, tags) {
-		// Update header table
-		updateTable('header-table', header);
+    window.addEventListener('message', event => {
+        const message = event.data;
+        if (message.command === 'flvData') {
+            const { header, tags, metadata } = message;
 
-		// Update metadata table
-		updateTable('metadata-table', metadata);
+            const headerContainer = document.getElementById('header');
+            const metadataContainer = document.getElementById('metadata');
+            const tagsContainer = document.getElementById('tags');
 
-		// Update tags tree
-		updateTagsTree(tags);
+            headerContainer.innerHTML = '';
+            const headerUl = document.createElement('ul');
+            renderTree(header, headerUl);
+            headerContainer.appendChild(headerUl);
 
-		// Hide error message if any
-		const errorMessage = document.getElementById('error-message');
-		if (errorMessage) {
-			errorMessage.textContent = '';
-		}
-	}
+            metadataContainer.innerHTML = '';
+            const metadataUl = document.createElement('ul');
+            renderTree(metadata, metadataUl);
+            metadataContainer.appendChild(metadataUl);
 
-	function updateTable(tableId, data) {
-		const tableBody = document.querySelector(`#${tableId} tbody`);
-		if (!tableBody) return;
-
-		// Clear existing content
-		tableBody.innerHTML = '';
-
-		// Populate table with data
-		if (data && Object.keys(data).length > 0) {
-			for (const [key, value] of Object.entries(data)) {
-				const row = document.createElement('tr');
-				const keyCell = document.createElement('td');
-				const valueCell = document.createElement('td');
-
-				keyCell.textContent = key;
-				
-				// Format value for better readability
-				if (typeof value === 'object') {
-					valueCell.textContent = JSON.stringify(value, null, 2);
-				} else {
-					valueCell.textContent = String(value);
-				}
-
-				row.appendChild(keyCell);
-				row.appendChild(valueCell);
-				tableBody.appendChild(row);
-			}
-		} else {
-			const row = document.createElement('tr');
-			const cell = document.createElement('td');
-			cell.colSpan = 2;
-			cell.textContent = 'No data available';
-			row.appendChild(cell);
-			tableBody.appendChild(row);
-		}
-	}
-
-	function updateTagsTree(tags) {
-		const tagsContent = document.getElementById('tags-content');
-		if (!tagsContent) return;
-
-		// Clear existing content
-		tagsContent.innerHTML = '';
-
-		if (!tags || tags.length === 0) {
-			tagsContent.textContent = 'No tags found';
-			return;
-		}
-
-		// Create tree structure
-		tags.forEach((tag, index) => {
-			const itemDiv = document.createElement('div');
-			itemDiv.className = 'tree-item';
-
-			const headerDiv = document.createElement('div');
-			headerDiv.className = 'tree-item-header';
-			headerDiv.textContent = `Tag ${index + 1}: ${tag.type.toUpperCase()} (${tag.dataSize} bytes, ${tag.timestamp}ms)`;
-
-			const childrenDiv = document.createElement('div');
-			childrenDiv.className = 'tree-item-children';
-
-			// Add tag details
-			const detailsPre = document.createElement('pre');
-			detailsPre.className = 'tag-details';
-			
-			// Format details for better readability
-			const details = { ...tag };
-			delete details.details; // Remove details object to avoid duplication
-			const formattedDetails = {
-				...details,
-				...tag.details
-			};
-			detailsPre.textContent = JSON.stringify(formattedDetails, null, 2);
-			childrenDiv.appendChild(detailsPre);
-
-			headerDiv.addEventListener('click', () => {
-				headerDiv.classList.toggle('expanded');
-				childrenDiv.classList.toggle('expanded');
-			});
-
-			itemDiv.appendChild(headerDiv);
-			itemDiv.appendChild(childrenDiv);
-			tagsContent.appendChild(itemDiv);
-		});
-	}
-
-	function showError(message) {
-		const errorMessage = document.getElementById('error-message');
-		if (errorMessage) {
-			errorMessage.textContent = message;
-		}
-	}
+            tagsContainer.innerHTML = '';
+            tags.forEach((tag, index) => {
+                const details = document.createElement('details');
+                const summary = document.createElement('summary');
+                summary.textContent = `Tag ${index + 1}: ${tag.Type} @ ${tag.Timestamp}`;
+                details.appendChild(summary);
+                
+                const ul = document.createElement('ul');
+                renderTree(tag, ul);
+                details.appendChild(ul);
+                tagsContainer.appendChild(details);
+            });
+        }
+    });
 }());
